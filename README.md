@@ -14,8 +14,6 @@ gpio_keys_agn {        
 
     };
 
-<img title="" src="file:///C:/Users/Peak-Li/AppData/Roaming/marktext/images/2023-06-16-10-06-21-image.png" alt="" width="524" data-align="inline">
-
 ## 2. 分析
 
 - `compatible`兼容性属性可以用于定位设备树对应节点`gpio_keys_agn`中的信息，将`of_device_id`结构体中`.compatible`成员设置为`"agn,gpio_key"`与设备树兼容性属性保持一致，然后在`platform_driver`结构体中`.driver`成员的`.of_match_table`成员进行匹配绑定，再在模块入口函数中用`platform_driver_register(&key_driver)`进行结构体绑定，获取对应设备树设备和对应设备节点。
