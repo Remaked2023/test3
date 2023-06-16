@@ -102,7 +102,7 @@ static int key_close (struct inode *inode, struct file *filp)
  * off:偏移量(未使用)
  */
 static ssize_t key_read (struct file *filp, char __user *buf,
-                     size_t len, loff_t *off)
+                     size_t len, loff_t *off)
 {
     /* 获取两引脚高低电平信息 */
     u8 key_val = 0;        // 最高0~7，设置8位
@@ -168,7 +168,7 @@ static int key_probe(struct platform_device *pdev)
     // 从设备树中查找"key-gpios",得到对应gpio口、引脚号、使能，共两组
     for (int num = 0; num < keydev->key_num; num++) {
         rt = of_get_named_gpio(pdevnode, "key-gpios", \
-                     keydev->key_gpios[num], num);
+                     keydev->key_gpios[num], num);
 
         if(rt < 0 ){
             printk(KERN_ERR "of_get_named_gpio key-gpios fail\n");
