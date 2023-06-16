@@ -69,9 +69,9 @@ static ssize_t key_read (struct file *filp, char __user *buf, size_t len, loff_t
     // 检测所有按键状态，
     for(int key_no = 0; key_no < num; key_no++) {
         if (gpio_get_value(keydev->key_gpios[key_no]) == 0) /* 按键按下 */
-            atomic_set(&keydev->key_vals, KEY_VAL);
+            atomic_set(&keydev->key_vals[key_no], KEY_VAL);
         else                                     /* 按键没有按下 */
-            atomic_set(&keydev->key_vals, INV_KEY_VAL);
+            atomic_set(&keydev->key_vals[key_no], INV_KEY_VAL);
     }
 
     /* 保存按键值 */
