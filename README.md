@@ -1,6 +1,14 @@
 # test3
 
-## 1. 题目
+[1.题目](#jump)
+
+[2.v3分析](#jump1)
+
+[3.gpio_key_agn -v4 当前版本](#jump2)
+
+[4.改进](#jump3)
+
+## <span id="jump">1. 题目</span>
 
 **根据dts设备树和原理图编写按键驱动程序，实现按键驱动功能。**
 
@@ -16,7 +24,7 @@ gpio_keys_agn {        
 
 ![Image](https://github.com/Remaked2023/image-blog/blob/main/image1-test3.png?raw=true)
 
-## 2. 分析
+## <span id ="jump1">2. v3分析</span>
 
 - `compatible`兼容性属性可以用于定位设备树对应节点`gpio_keys_agn`中的信息，将`of_device_id`结构体中`.compatible`成员设置为`"agn,gpio_key"`与设备树兼容性属性保持一致，然后在`platform_driver`结构体中`.driver`成员的`.of_match_table`成员进行匹配绑定，再在模块入口函数中用`platform_driver_register(&key_driver)`进行结构体绑定，获取对应设备树设备和对应设备节点。
 
@@ -36,12 +44,35 @@ gpio_keys_agn {        
     
     ...keyn,keyn-1,...,key1    对应0为松开，1为摁下，最高8个按键状态
 
-## 3. gpio_keys_agn -v3  当前版本(未实际编译，人眼检错版本)
+## <span id="jump2">3. gpio_keys_agn -v4  当前版本</span>
 
 ```c
-#include <linux/init.h>        // __init __exit
-#include <linux/kernel.h>    // printk
-#include <linux/module.h>    // module_init module_exit
+/*
+ * static int __init gpio_init(void);   驱动入口函数
+ * 注册平台驱动(1.绑定平台入口出口函数、2.绑定设备树节点)
+ * 
+ * static int key_probe(struct platform_device *pdev);  平台入口函数
+ * 1.注册混杂设备(注册次设备号，绑定文件操作集)
+ * 2.获取设备树节点的引脚地址gpio_2和gpio_7并申请引脚资源用于ioctl等文件操作函数
+ * 3.初始化等待队列头
+ * 4.初始化gpio2和gpio7的按键中断，共享模式、下降沿触发(按键按下)
+ * 
+ * irqreturn_t keys_irq_handler(int irq, void *dev);    中断服务函数
+ * 1.用(中断号不知道)判断哪个按键按下，逻辑上只同时允许1个按键按下，中断可被打断
+ * 2.设置全局变量值keydev.keyvals获取当前按下键位
+ * 3.设置等待队列条件为真，唤醒等待队列
+ * 
+ * static long key_ioctl (struct file *filp,
+ *           unsigned int cmd, unsigned long args);     文件操作，目前只设置读
+ * 1.响应等待队列，阻塞直到等待条件为真(中断处理完成)
+ * 2.送按下键位给应用层
+ * 
+ * static int key_remove(struct platform_device *pdev);    平台卸载函数
+ * static void __exit gpio_exit(void);          驱动卸载函数
+ */
+#include <linux/init.h>		// __init __exit
+#include <linux/kernel.h>	// printk
+#include <linux/module.h>	// module_init module_exit
 #include <linux/cdev.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
@@ -51,32 +82,70 @@ gpio_keys_agn {        
 #include <linux/gpio.h>
 #include <linux/miscdevice.h>   // 混杂设备
 #include <linux/platform_device.h>  // 平台设备驱动模型
-#include <linux/of.h>        // 设备树相关头文件
+#include <linux/of.h>		// 设备树相关头文件
 #include <linux/of_gpio.h>
 #include <linux/of_address.h>
 #include <linux/of_fdt.h>
 #include <linux/of_platform.h>
 #include <linux/string.h>
+#include <linux/interrupts.h>   //中断常用的函数接口
+#include <mach/devices.h>       //中断号
+#include <linux/sched.h>        //等待队列头
 /* 少了对应芯片类型的头文件 */
 
 #if 0             //设备树  
 gpio_keys_agn {         
         compatible = "agn,gpio_key";        // 兼容性
-        key-gpios = <&pio 2 GPIO_ACTIVE_LOW //引脚资源
-            &pio 7 GPIO_ACTIVE_LOW>;
+		key-gpios = <&pio 2 GPIO_ACTIVE_LOW //引脚资源
+			&pio 7 GPIO_ACTIVE_LOW>;
     };   
 #endif
 
 /* 定义按键值 */
-#define KEY_VAL         0xF0              // 按键摁下
-#define INV_KEY_VAL     0x00              // 按键松开
+#define KEY_VAL         1              // 按键摁下
+#define INV_KEY_VAL     0              // 按键松开
+
+#define GPIO_KEY_READ   _IO('K', 0);    //ioctl的cmd定义
+
+unsigned int key2 = 2;      //按键2的中断服务函数参数(标识)
+unsigned int key7 = 7;      //按键7的中断服务函数参数(标识)
+
+static int key_press_flag = 0;
+static wait_queue_head_t gpio_key_wq;
 
 /* key设备结构体 */
 struct key_dev {
     int key_num = 2;                   /* gpio引脚占用数 */
-    int key_gpios[key_num];            /* key使用的GPIO编号，总计2个 */
-    atomic_t key_vals[key_num];        /* 按键值，对应两个GPIO引脚 */
+    int key_gpios[key_num] = {0};      /* key使用的GPIO引脚，总计2个 */
+    int key_vals = 0;        /* 按键值，对应两个GPIO引脚 */
 } keydev;
+
+/* 中断服务函数，获取按键状态，下降沿触发，按下时写按键状态到keydev
+ * irq中断号，dev是传入参数指针
+ * 中断正常返回1，失败返回0
+ */
+irqreturn_t keys_irq_handler(int irq, void *dev)
+{
+    //获取参数内容
+    unsigned int key = *(unsigned int *) dev;   //强转
+    printk("key_irq_handler\n");
+
+    //判断按键
+    /*
+        if (irq == gpio_to_irq(keydev.key_gpios[0]))
+        因为不确定gpio_to_irq()会不会造成阻塞，
+        暂时用传参key作为不准确的判断条件
+    */
+    if (key == 2) keydev.key_vals |= 1<<0;  //...01
+    if (key == 7) keydev.key_vals |= 1<<1;  //...10
+
+    //队列等待条件为真，代表按键按下
+    key_press_flag = 1;
+    //唤醒队列
+    wake_up(&gpio_key_wq);
+
+    return IRQ_HANDLED;
+}
 
 
 static int key_open (struct inode *inode, struct file *filp)
@@ -91,54 +160,49 @@ static int key_open (struct inode *inode, struct file *filp)
 static int key_close (struct inode *inode, struct file *filp)
 {
     printk("key_close\n");
-
+    
     return 0;
 }
 
 /* 处理获取的引脚电平数据，处理后送数据到用户空间 */
-/* file:打开文件路径
- * buf: 用户用于接收端口高低电平
+/* filp:打开文件路径
+ * cmd:指令集，目前只包含读
  * len:接收数组长度(未使用)
  * off:偏移量(未使用)
  */
-static ssize_t key_read (struct file *filp, char __user *buf,
-                     size_t len, loff_t *off)
+static long key_ioctl (struct file *filp, unsigned int cmd, unsigned long args)
 {
-    /* 获取两引脚高低电平信息 */
-    u8 key_val = 0;        // 最高0~7，设置8位
-    int num = keydev->key_num;
-
-    // 检测所有按键状态，
-    for(int key_no = 0; key_no < num; key_no++) {
-        if (gpio_get_value(keydev->key_gpios[key_no]) == 0) /* 按键按下 */
-            atomic_set(&keydev->key_vals[key_no], KEY_VAL);
-        else                                     /* 按键没有按下 */
-            atomic_set(&keydev->key_vals[key_no], INV_KEY_VAL);
-    }
-
-    /* 保存按键值 */
-    for(int key_no = num - 1; key_no >= 0; key_no--) {
-        if (keydev->key_vals[key_no] == KEY_VAL) 
-            key_val |= 0x01;        // 用1表示按键按下
-
-        if (key_no != 0)
-            key_val = key_val<<1;   // 从右到左依次表示key1~keyn按键状态
+    int rt = 0;
+    switch (cmd){
+    case GPIO_KEY_READ：
+        //访问等待队列，判断key_press_flag条件是否为真
+        //可中断睡眠
+        wait_event_interruptible(gpio_key_wq, key_press_flag);
+        key_press_flag = 0;
+        break;
+    default:
+        printk("key ENOIOCTLCMD\n");
+        return -ENOIOCTLCMD;
     }
 
     /* #include <linux/uaccess.h>
      * unsigned long copy_to_user(void __user *to,
      *    const void *from, unsigned long n);
-     */
-    copy_to_user(buf, &key_val, sizeof(key_val));  // 送出数据
+     */    
+    rt = copy_to_user((void *)args, &keydev.key_vals);
+    keydev.key_vals = 0;
 
-    return num; // 返回读取有效数据位数
+    if (rt != 0)
+        return -EFAULT;
+    
+    return 0;
 }
 
 // 文件操作结构体，绑定open、close、read函数
 static const struct file_operations key_fops = {
     .open = key_open,
     .release = key_close,
-    .read = key_read,
+    .ioctl = key_ioctl,
     .module = THIS.MODULE,
 };
 
@@ -165,10 +229,9 @@ static int key_probe(struct platform_device *pdev)
         return rt;
     }
 
-    // 从设备树中查找"key-gpios",得到对应gpio口、引脚号、使能，共两组
+    // 从设备树中查找"key-gpios"，得到对应gpio口、引脚号、使能，共两组
     for (int num = 0; num < keydev->key_num; num++) {
-        rt = of_get_named_gpio(pdevnode, "key-gpios", \
-                     keydev->key_gpios[num], num);
+        rt = of_get_named_gpio(pdevnode, "key-gpios", keydev->key_gpios[num], num);
 
         if(rt < 0 ){
             printk(KERN_ERR "of_get_named_gpio key-gpios fail\n");
@@ -178,15 +241,15 @@ static int key_probe(struct platform_device *pdev)
 
         // 提示引脚信息，包括引脚地址和引脚有效信号
         printk(KERN_INFO "key%d %s\n", num, keydev->key_gpios[num]);
-
+        
         // 释放gpio引脚
         gpio_free(keydev->key_gpios[num]);
-
-        char key_name[6];
+        
+        char key_name[6];       //keyn\0
         sprintf(key_name, "key%d", num);
 
         // 重新申请gpio引脚资源
-        rt = gpio_request(keydev_num[num], key_name);
+        rt = gpio_request(keydev->key_gpios[num], key_name);
         if (rt < 0){
             printk(KERN_ERR "gpio_request fail\n");
 
@@ -194,9 +257,31 @@ static int key_probe(struct platform_device *pdev)
         }
     }
 
+    //初始化队列头，用于中断后传输按下键位，唤醒不需要在入口函数进行
+    init_waitqueue_head(gpio_key_wq);
+
+    //申请中断1，设置gpio2中断方式
+    rt = request_irq(gpio_to_irq(key_gpios[0], keys_irq_handler, 
+                    IRQF_SHARED | IRQF_TRIGGER_FALLING, "gpio_2", &key2));
+    if (rt) {
+        printk("request_irq error\n");
+        goto err_request_irq;
+    }
+    //申请中断2，设置gpio7中断方式
+    rt = request_irq(gpio_to_irq(key_gpios[1], keys_irq_handler, 
+                    IRQF_SHARED | IRQF_TRIGGER_FALLING, "gpio_7", &key7));
+    if (rt) {
+        printk("request_irq error\n");
+        goto err_request_irq;
+    }    
+
+    printk("key_probe init");
     return 0;
 
 // 错误处理
+err_request_irq:
+    free_irq(gpio_to_irq(key_gpios[0]), &key2);
+    free_irq(gpio_to_irq(key_gpios[1]), &key7);
 err_gpio_request:
 err_of_get_named_gpio:
     misc_deregister(&key_misc); // 注销设备
@@ -209,7 +294,7 @@ static int key_remove(struct platform_device *pdev)
 {
     for (int num = 0; num < keydev->key_num; num++)
         gpio_free(keydev->key_gpios[num]);     
-
+    
     misc_deregister(&key_misc); // 注销设备
 
     return 0;
@@ -265,3 +350,15 @@ MODULE_AUTHOR("Linhongyi");
 MODULE_DESCRIPTION("gpio-key driver");
 MODULE_LICENSE("GPL");
 ```
+
+## <span id="jump3">4. 改进</span>
+
+1. 首先是就实时性改进，需要把不停检测按键状态读取的方式改成按键按下时才读取。用中断的方式，当对应gpio口产生一次下降沿即按键按下时，触发中断对按键值进行变动，但是因为要避免阻塞，在中断服务函数不能使用信号量处理函数，于是遇到了数据传输问题。
+
+2. 解决方式是用等待队列的方式让用户层的读操作等待按键中断发生，然后在按键中断结束后再读取按键值，然后重新清空按键。缺点是在用户层会造成线程阻塞，优点是不再需要死循环，读取成功后就能直接进行其他操作。
+
+3. 平台驱动函数里增加了队列头的初始化，并额外申请了gpio口的中断。
+
+4. 读取函数改为了调用ioctl的方式，更新了file_operations操作集中read和ioctl的绑定。
+
+5. 文件读取函数中响应等待队列，在按键中断发生后对按键值读取，然后再复位队列标志和传出按键键位值
