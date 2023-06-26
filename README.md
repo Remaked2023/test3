@@ -58,14 +58,18 @@ gpio_keys_agn {        
  * 4.初始化gpio2和gpio7的按键中断，共享模式、双边沿触发
  * 
  * irqreturn_t keys_irq_handler(int irq, void *dev);    中断服务函数
- * 1.延时消抖
- * 2.唤醒队列
+ * 1.设置key_tasklet的data成员值为中断号
+ * 2.调度key_tasklet
  * 
+ * void key_tasklet_handler(unsigned long data)；   小任务，中断下半部
+ * 1.判断中断号是否合法
+ * 2.处理键值数据保存到key_val
+ * 3.队列标志位置1，唤醒队列
  * 
  * static long key_ioctl (struct file *filp,
  *           unsigned int cmd, unsigned long args);     文件操作，目前只设置读
  * 1.响应等待队列，阻塞直到等待条件为真(中断处理完成)
- * 2.处理并送按键状态给应用层
+ * 2.送按键状态给应用层
  * 
  * static int key_remove(struct platform_device *pdev);    平台卸载函数
  * static void __exit gpio_exit(void);          驱动卸载函数
@@ -122,29 +126,44 @@ static int key_press_flag = 0;
 /* 等待队列头 */
 static wait_queue_head_t gpio_key_wq;
 
+/* tasklet处理函数
+ * data是传入参数，设定为传入中断号
+ * 如传入中断号有效(>=0)，则进行延时消抖和按键状态处理，并在处理后唤醒队列
+ */
+void key_tasklet_handler(unsigned long data)
+{
+    int irq = (int)data;
 
+    if (irq >=0) {
+        //10ms消抖，不会造成阻塞，但会延长处理时间
+        mdelay(10);
+        /* gpiod_get_value()属于原子操作，不会造成阻塞，
+        但在tasklet中使用全局变量key_val需要注意 */
+        key_val = gpiod_get_value(gpio_key2) << 1 | gpiod_get_value(gpio_key7);
 
-/* 中断处理函数，双边沿触发，延时消抖后唤醒队列
+        //队列等待条件为真，代表按键状态发生改变
+        key_press_flag = 1;
+        //唤醒队列
+        wake_up(&gpio_key_wq);
+    }
+}
+
+//分配初始化tasklet,名字、处理函数、data初始值
+DECLARE_TASKLET(key_tasklet, key_tasklet_handler, -1);
+
+/* 中断处理函数，双边沿触发，传入中断号给key_tasklet，并调度该小任务
  * irq中断号，dev是传入参数指针
  * 中断正常返回1，失败返回0
  */
 irqreturn_t keys_irq_handler(int irq, void *dev)
 {
+    //设定tasklet传参为中断号
+    key_tasklet.data = (unsigned long)irq;
+
+    //登记调度tasklet，将按键操作处理交由中断下半部进行
+    tasklet_schedule(&key_tasklet);
+
     printk("key_irq_handler\n");
-
-    //判断按键
-    /*
-        if (irq == gpio_to_irq(keydev.key_gpios[0]))
-        因为不确定gpio_to_irq()会不会造成阻塞，
-        暂时用传参key作为不准确的判断条件
-    */
-    mdelay(10); //10ms消抖，不会造成阻塞，但会延长中断处理时间
-
-    //队列等待条件为真，代表按键按下
-    key_press_flag = 1;
-    //唤醒队列
-    wake_up(&gpio_key_wq);
-
     return IRQ_HANDLED;
 }
 
@@ -165,7 +184,7 @@ static int key_close (struct inode *inode, struct file *filp)
     return 0;
 }
 
-/* 处理gpio电平数据，处理后送数据到用户空间 */
+/* 处理gpio按键状态数据，处理后送数据到用户空间 */
 /* filp:打开文件路径
  * cmd:指令集，目前只包含读
  * len:接收数组长度(未使用)
@@ -174,6 +193,9 @@ static int key_close (struct inode *inode, struct file *filp)
 static long key_ioctl (struct file *filp, unsigned int cmd, unsigned long args)
 {
     int rt = 0;
+    //先让的队列休眠，防止在读取前队列处于唤醒状态
+    key_press_flag = 0;
+
     switch (cmd){
     case GPIO_KEY_READ：
         //访问等待队列，判断key_press_flag条件是否为真
@@ -185,9 +207,6 @@ static long key_ioctl (struct file *filp, unsigned int cmd, unsigned long args)
         printk("key ENOIOCTLCMD\n");
         return -ENOIOCTLCMD;
     }
-
-    /* 获取并处理按键状态 */
-    key_val = gpiod_get_value(gpio_key2) << 1 | gpiod_get_value(gpio_key7) << 0;
 
     /* #include <linux/uaccess.h>
      * unsigned long copy_to_user(void __user *to,
@@ -364,3 +383,5 @@ MODULE_LICENSE("GPL");
 5. 文件读取函数中响应等待队列，在按键中断发生后对按键值读取，然后再复位队列标志和传出按键键位值
 
 6. V5在V4基础上改用了gpiod描述符的方式，缩减了代码量；同时在中断触发上改用双边沿触发的方式，增加按键松开检测；在中断处理上将键值获取和处理交给中断外部进行，减少中断处理命令数；但在中断里增加了延时用于按键消抖，后续想用tasklet机制来处理按键消抖和处理按键数据，想法暂时先保留。
+
+7. V6在V5基础上将中断处理函数中的延时和队列唤醒工作转移到tasklet中，同时也把在ioctl中的按键状态处理部分转移到tasklet中，降低按键处理的优先度来加强实时性。同时，也修复了一些bug：如在读取时没有在当前读取先行将等待队列标志清0，可能导致中断在读取前发生后等待队列处于唤醒状态，直接读取了过期的按键状态而没有阻塞；以及在中断函数中使用延时导致中断时间变长等。
